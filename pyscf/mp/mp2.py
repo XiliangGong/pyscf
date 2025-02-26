@@ -173,6 +173,7 @@ def make_rdm1(mp, t2=None, eris=None, ao_repr=False, with_frozen=True):
                                ao_repr=ao_repr)
 
 def _gamma1_intermediates(mp, t2=None, eris=None):
+    
     if t2 is None: t2 = mp.t2
     nmo = mp.nmo
     nocc = mp.nocc
@@ -189,17 +190,25 @@ def _gamma1_intermediates(mp, t2=None, eris=None):
     dm1occ = numpy.zeros((nocc,nocc), dtype=dtype)
     dm1vir = numpy.zeros((nvir,nvir), dtype=dtype)
     for i in range(nocc):
+        print(f'number of nocc: {nocc}')
+        print(f'value of i: {i}')
         if t2 is None:
             gi = numpy.asarray(eris.ovov[i*nvir:(i+1)*nvir])
             gi = gi.reshape(nvir,nocc,nvir).transpose(1,0,2)
             t2i = gi.conj()/lib.direct_sum('jb+a->jba', eia, eia[i])
         else:
+            print('enter t2 have')
+            print(f'shape of t2: {t2.shape}')
             t2i = t2[i]
         l2i = t2i.conj()
+        print(f'shape of l2i: {l2i.shape}')
+        print(f'shape of t2i: {t2i.shape}')
         dm1vir += lib.einsum('jca,jcb->ba', l2i, t2i) * 2 \
                 - lib.einsum('jca,jbc->ba', l2i, t2i)
         dm1occ += lib.einsum('iab,jab->ij', l2i, t2i) * 2 \
                 - lib.einsum('iab,jba->ij', l2i, t2i)
+        
+    print(f'exit loop')
     return -dm1occ, dm1vir
 
 
@@ -253,6 +262,8 @@ def make_fno(mp, thresh=1e-6, pct_occ=None, nvir_act=None, t2=None):
     else:
         nvir_keep = min(nvir, nvir_act)
 
+    print(f'nvir_keep: {nvir_keep}')
+
     masks = _mo_splitter(mp)
     moeoccfrz0, moeocc, moevir, moevirfrz0 = [mf.mo_energy[m] for m in masks]
     orboccfrz0, orbocc, orbvir, orbvirfrz0 = [mf.mo_coeff[:,m] for m in masks]
@@ -268,6 +279,8 @@ def make_fno(mp, thresh=1e-6, pct_occ=None, nvir_act=None, t2=None):
     nocc_loc = numpy.cumsum([0]+[x.shape[1] for x in no_comp]).astype(int)
     no_frozen = numpy.hstack((numpy.arange(nocc_loc[0], nocc_loc[1]),
                               numpy.arange(nocc_loc[3], nocc_loc[5]))).astype(int)
+    
+
 
     return no_frozen, no_coeff
 
@@ -901,10 +914,16 @@ del (WITH_T2)
 if __name__ == '__main__':
     from pyscf import scf
     mol = gto.Mole()
-    mol.atom = [
-        [8 , (0. , 0.     , 0.)],
-        [1 , (0. , -0.757 , 0.587)],
-        [1 , (0. , 0.757  , 0.587)]]
+    # mol.atom = [
+    #     [8 , (0. , 0.     , 0.)],
+    #     [1 , (0. , -0.757 , 0.587)],
+    #     [1 , (0. , 0.757  , 0.587)]]
+    
+    mol.atom = '''
+    O          0.00000        0.00000        0.11779
+    H          0.00000        0.75545       -0.47116
+    H          0.00000       -0.75545       -0.47116
+    '''
 
     mol.basis = 'cc-pvdz'
     mol.build()

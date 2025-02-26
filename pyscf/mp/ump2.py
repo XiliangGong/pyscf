@@ -304,6 +304,7 @@ def make_fno(mp, thresh=1e-6, pct_occ=None, nvir_act=None, t2=None, eris=None):
     '''
     mf = mp._scf
     dmab = mp.make_rdm1(t2=t2, with_frozen=False)
+    print('dmab', dmab)
 
     masks = _mo_splitter(mp)
 

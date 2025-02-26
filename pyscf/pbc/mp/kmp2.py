@@ -40,6 +40,10 @@ from pyscf.pbc.lib import kpts as libkpts
 from pyscf.lib.parameters import LARGE_DENOM
 from pyscf import __config__
 
+# import sys
+# sys.path.append('/Users/xlgong/software/lno/lno/rpa')
+# import krpa
+
 WITH_T2 = getattr(__config__, 'mp_mp2_with_t2', True)
 
 def kernel(mp, mo_energy, mo_coeff, verbose=logger.NOTE, with_t2=WITH_T2):
@@ -563,6 +567,88 @@ def _add_padding(mp, mo_coeff, mo_energy):
         mo_energy = padded_mo_energy(mp, mo_energy)
     return mo_coeff, mo_energy
 
+def make_fno(mp, thresh=1e-6, pct_occ=None, nvir_act=None):
+    print("Making FNO")
+    mf = mp._scf 
+    dm = mp.make_rdm1(t2=None)
+    for i, result in enumerate(dm):
+        print(f"Shape of density matrix {i}: {result.shape}")
+
+    nmo = mp.nmo
+    nocc = mp.nocc
+    nocc1 = mf.cell.nelectron // 2
+    print(f"nocc in make_fno: {nocc}")
+    print(f"nocc1 in make_fno: {nocc1}")
+    nvir = nmo - nocc
+    nkpts = len(mp.kpts)
+    no_frozen_kpts = []
+    no_coeff_kpts = []
+    nvir_keep_list = []
+    no_energy_final = []
+
+    for k, dmk in enumerate(dm):  # Loop over k-points
+        # Diagonalize the virtual-virtual block
+        n, v = np.linalg.eigh(dmk[nocc:, nocc:])  # diagonalize the VV block D_ab = \sum_{\alpha} n_\alpha U_{a \alpha} U_{b \alpha}^*
+        idx = np.argsort(n)[::-1]  # Sort eigenvalues in descending order
+        n, v = n[idx], v[:, idx]  # Sort eigenvalues and eigenvectors
+
+        # Determine the number of virtual orbitals to keep
+        if nvir_act is None:
+            if pct_occ is None:
+                nvir_keep = np.count_nonzero(n > thresh)
+            else:
+                cumsum = np.cumsum(n / np.sum(n))
+                nvir_keep = np.count_nonzero(
+                    [c <= pct_occ or np.isclose(c, pct_occ) for c in cumsum]
+                )
+        else:
+            nvir_keep = min(nvir, nvir_act)
+
+        nvir_keep_list.append(nvir_keep)
+        
+
+        moe = mf.mo_energy[k].copy()
+        moc = mf.mo_coeff[k].copy()
+
+        # Extract MO energies and coefficients for this k-point
+        maskact_k = np.asarray(mp.get_frozen_mask()[k])
+        maskocc_k = np.asarray(mp.mo_occ[k]) > 1e-10   # ??
+        masks = mo_splitter(maskact_k, maskocc_k, kind='index')
+
+        # Return maskfrzocc, maskactocc, maskactvir, maskfrzvir
+        # maskfrzocc, maskactocc, maskactvir, maskfrzvir = masks
+        moeoccfrz0, moeocc, moevir, moevirfrz0 = [moe[m] for m in masks]
+        orboccfrz0, orbocc, orbvir, orbvirfrz0 = [moc[:, m] for m in masks]
+
+        # Semicanonicalize the NOs
+        fvv = np.diag(moevir)
+        fvv_no = np.dot(v.T.conj(), np.dot(fvv, v))
+        no_energy, v_canon = np.linalg.eigh(fvv_no[:nvir_keep, :nvir_keep])
+        moe[nocc1:nocc1+nvir_keep] = no_energy
+
+        orbviract = np.dot(orbvir, np.dot(v[:, :nvir_keep], v_canon))
+        orbvirfrz = np.dot(orbvir, v[:, nvir_keep:])
+        no_comp = (orboccfrz0, orbocc, orbviract, orbvirfrz, orbvirfrz0)
+        no_coeff = np.hstack(no_comp)
+
+        # Identify frozen orbitals
+        nocc_loc = np.cumsum([0] + [x.shape[1] for x in no_comp]).astype(int)
+        no_frozen = np.hstack((
+            np.arange(nocc_loc[0], nocc_loc[1]),  # Frozen occupied
+            np.arange(nocc_loc[3], nocc_loc[5])   # Frozen virtual
+        )).astype(int)
+
+        # Store results for this k-point
+        no_frozen_kpts.append(no_frozen)
+        no_frozen_final = no_frozen_kpts
+
+        no_coeff_kpts.append(no_coeff)
+        no_coeff_final = no_coeff_kpts
+
+        no_energy_final.append(moe)
+
+    return no_energy_final, no_frozen_final, no_coeff_final
+
 
 def make_rdm1(mp, t2=None, kind="compact"):
     r"""
@@ -598,7 +684,39 @@ def make_rdm1(mp, t2=None, kind="compact"):
             result.append(d[np.ix_(idxs, idxs)])
     return result
 
+def mo_splitter(maskact, maskocc, kind='mask'):
+    ''' Split MO indices into
+        - frozen occupieds
+        - active occupieds
+        - active virtuals
+        - frozen virtuals
 
+    Args:
+        maskact (array-like, bool type):
+            An array of length nmo with bool elements. True means an MO is active.
+        maskocc (array-like, bool type):
+            An array of length nmo with bool elements. True means an MO is occupied.
+        kind (str):
+            Determine the return type.
+            'mask'  : return masks each of length nmo
+            'index' : return index arrays
+            'idx'   : same as 'index'
+
+    Return:
+        See the description for input arg 'kind' above.
+    '''
+    maskfrzocc = ~maskact &  maskocc
+    maskactocc =  maskact &  maskocc
+    maskactvir =  maskact & ~maskocc
+    maskfrzvir = ~maskact & ~maskocc
+    if kind == 'mask':
+        return maskfrzocc, maskactocc, maskactvir, maskfrzvir
+    elif kind in ['index','idx']:
+        return [np.where(m)[0] for m in [maskfrzocc, maskactocc,
+                                         maskactvir, maskfrzvir]]
+    else:
+        raise ValueError("'kind' must be 'mask' or 'index'(='idx').")
+    
 def make_rdm2(mp, t2=None, kind="compact"):
     r'''
     Spin-traced two-particle density matrix in MO basis
@@ -681,7 +799,6 @@ def _gamma1_intermediates(mp, t2=None):
         for kj in range(nkpts):
             for ka in range(nkpts):
                 kb = mp.khelper.kconserv[ki, ka, kj]
-
                 dm1vir[kb] += einsum('ijax,ijay->yx', t2[ki][kj][ka].conj(), t2[ki][kj][ka]) * 2 -\
                               einsum('ijax,ijya->yx', t2[ki][kj][ka].conj(), t2[ki][kj][kb])
                 dm1occ[kj] += einsum('ixab,iyab->xy', t2[ki][kj][ka].conj(), t2[ki][kj][ka]) * 2 -\
@@ -738,6 +855,7 @@ class KMP2(mp2.MP2):
     get_frozen_mask = get_frozen_mask
     make_rdm1 = make_rdm1
     make_rdm2 = make_rdm2
+    make_fno = make_fno
 
     def dump_flags(self):
         logger.info(self, "")
@@ -796,26 +914,59 @@ scf.krohf.KROHF.MP2 = None
 
 if __name__ == '__main__':
     from pyscf.pbc import gto, scf, mp
+    from pyscf.pbc.tools.pbc import super_cell
 
-    cell = gto.Cell()
-    cell.atom='''
-    C 0.000000000000   0.000000000000   0.000000000000
-    C 1.685068664391   1.685068664391   1.685068664391
-    '''
-    cell.basis = 'gth-szv'
-    cell.pseudo = 'gth-pade'
-    cell.a = '''
-    0.000000000, 3.370137329, 3.370137329
-    3.370137329, 0.000000000, 3.370137329
-    3.370137329, 3.370137329, 0.000000000'''
-    cell.unit = 'B'
-    cell.verbose = 5
-    cell.build()
+    # cell = gto.Cell()
+    # atom = '''
+    # O          0.00000        0.00000        0.11779
+    # H          0.00000        0.75545       -0.47116
+    # H          0.00000       -0.75545       -0.47116
+    # '''
+    # cell.basis = 'cc-pvdz'
+    # # cell.pseudo = 'gth-pade'
+    # cell.a = '''
+    # 0.000000000, 3.370137329, 3.370137329
+    # 3.370137329, 0.000000000, 3.370137329
+    # 3.370137329, 3.370137329, 0.000000000'''
+    # cell.unit = 'B'
+    # cell.verbose = 5
+    # cell.build()
 
     # Running HF and MP2 with 1x1x2 Monkhorst-Pack k-point mesh
-    kmf = scf.KRHF(cell, kpts=cell.make_kpts([1,1,2]), exxdiv=None)
-    ehf = kmf.kernel()
+    # kmf = scf.KRHF(cell, kpts=cell.make_kpts([1,1,2]), exxdiv=None)
+    # ehf = kmf.kernel()
+
+    atom = '''
+    O          0.00000        0.00000        0.11779
+    H          0.00000        0.75545       -0.47116
+    H          0.00000       -0.75545       -0.47116
+    '''
+    basis = 'cc-pvdz'
+    # frozen = 1
+    # a = np.eye(3) * 20
+    a = np.eye(3) * 3
+    omega = 0.1
+    kmesh = [1,1,1]
+    cell = gto.M(atom=atom, basis=basis, a=a)
+    supcell = super_cell(cell, [5, 1, 1]) 
+    kpts = supcell.make_kpts(kmesh)
+    
+    kmf = scf.KRHF(supcell, kpts=kpts).density_fit()
+    kmf.kernel()
+
+
 
     mymp = mp.KMP2(kmf)
     emp2, t2 = mymp.kernel()
-    print(emp2 - -0.204721432828996)
+    mymp.make_fno()
+
+    ddd= mymp.nocc
+    print(ddd)
+    print(t2[0,0,0,0,0,0])
+    # print(emp2 - -0.204721432828996)
+
+
+
+
+
+
